@@ -1,0 +1,421 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <TM1637Display.h>
+
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// TM1637
+#define TM_DIO 18
+#define TM_CLK 19
+
+TM1637Display display(TM_CLK, TM_DIO);
+
+// JOYSTICK
+#define VRX 34
+#define SW 13
+
+// LEDS
+#define LED_AMARILLO 25
+#define LED_BLANCO 27
+
+// ESTADOS
+#define MENU 0
+#define ENTRENO 1
+#define DESCANSO 2
+
+int estado = MENU;
+
+// TIEMPOS EN MINUTOS
+int tiempoEntreno = 5;
+int tiempoDescanso = 5;
+
+// TEMPORIZADOR
+unsigned long inicioTemporizador = 0;
+unsigned long duracionTemporizador = 0;
+unsigned long ultimaActualizacionTiempo = 0;
+
+bool temporizadorActivo = false;
+
+// CONTROL JOYSTICK
+bool puedeMover = true;
+
+// CONTROL BOTON
+bool botonAnterior = HIGH;
+
+// PAQUETE COMUN
+typedef struct {
+  uint8_t tipo;
+  uint8_t reservado[3];
+  int32_t bpm;
+  uint32_t golpes;
+  float velocidad;
+  float temperatura;
+} Paquete;
+
+const uint8_t TIPO_BPM = 1;
+const uint8_t TIPO_MOVIMIENTO = 2;
+
+// DATOS RECIBIDOS
+volatile int32_t bpmActual = 0;
+volatile uint32_t golpesActual = 0;
+volatile float velocidadActual = 0;
+volatile float temperaturaActual = 0;
+
+// PROTEGER DATOS
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// RECIBIR DATOS DE LOS DOS EMISORES
+void recibirDatos(
+  const esp_now_recv_info_t *info,
+  const uint8_t *data,
+  int len
+) {
+  if (len != sizeof(Paquete)) {
+    return;
+  }
+
+  Paquete recibido;
+  memcpy(&recibido, data, sizeof(recibido));
+
+  portENTER_CRITICAL(&mux);
+
+  if (recibido.tipo == TIPO_BPM) {
+    bpmActual = recibido.bpm;
+  }
+  else if (recibido.tipo == TIPO_MOVIMIENTO) {
+    golpesActual = recibido.golpes;
+    velocidadActual = recibido.velocidad;
+    temperaturaActual = recibido.temperatura;
+  }
+
+  portEXIT_CRITICAL(&mux);
+}
+
+// CONTROL DE LEDS
+void ledsApagados() {
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_BLANCO, LOW);
+}
+
+void ledEntrenamiento() {
+  digitalWrite(LED_AMARILLO, HIGH);
+  digitalWrite(LED_BLANCO, LOW);
+}
+
+void ledDescanso() {
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_BLANCO, HIGH);
+}
+
+// MOSTRAR TIEMPO EN TM1637
+void mostrarTiempo(unsigned long segundos) {
+  unsigned long minutos = segundos / 60;
+  unsigned long seg = segundos % 60;
+
+  if (minutos > 99) {
+    minutos = 99;
+  }
+
+  int numero = minutos * 100 + seg;
+
+  display.showNumberDecEx(
+    numero,
+    0b01000000,
+    true
+  );
+}
+
+// ACTUALIZAR LCD
+void actualizarLCD() {
+  int32_t bpm;
+  uint32_t golpes;
+  float velocidad;
+
+  portENTER_CRITICAL(&mux);
+  bpm = bpmActual;
+  golpes = golpesActual;
+  velocidad = velocidadActual;
+  portEXIT_CRITICAL(&mux);
+
+  char linea1[17];
+  char linea2[17];
+
+  // PRIMERA LINEA: BPM Y GOLPES
+  snprintf(
+    linea1,
+    sizeof(linea1),
+    "BPM:%3ld G:%4lu",
+    (long)bpm,
+    (unsigned long)golpes
+  );
+
+  // SEGUNDA LINEA
+  if (estado == MENU) {
+    snprintf(
+      linea2,
+      sizeof(linea2),
+      "E:%02d D:%02d MENU",
+      tiempoEntreno,
+      tiempoDescanso
+    );
+  }
+  else if (estado == ENTRENO) {
+    if (velocidad > 9999) velocidad = 9999;
+
+    snprintf(
+      linea2,
+      sizeof(linea2),
+      "V:%4.0f d/s ENT",
+      velocidad
+    );
+  }
+  else {
+    if (velocidad > 9999) velocidad = 9999;
+
+    snprintf(
+      linea2,
+      sizeof(linea2),
+      "V:%4.0f d/s DES",
+      velocidad
+    );
+  }
+
+  lcd.setCursor(0, 0);
+  lcd.print("                ");
+  lcd.setCursor(0, 0);
+  lcd.print(linea1);
+
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  lcd.setCursor(0, 1);
+  lcd.print(linea2);
+}
+
+// COMENZAR ENTRENAMIENTO
+void comenzarEntrenamiento() {
+  estado = ENTRENO;
+
+  temporizadorActivo = true;
+  inicioTemporizador = millis();
+
+  duracionTemporizador =
+    (unsigned long)tiempoEntreno * 60000UL;
+
+  ultimaActualizacionTiempo = 0;
+
+  ledEntrenamiento();
+
+  mostrarTiempo(
+    (unsigned long)tiempoEntreno * 60
+  );
+
+  actualizarLCD();
+
+  Serial.println("ENTRENAMIENTO INICIADO");
+}
+
+// COMENZAR DESCANSO
+void comenzarDescanso() {
+  estado = DESCANSO;
+
+  temporizadorActivo = true;
+  inicioTemporizador = millis();
+
+  duracionTemporizador =
+    (unsigned long)tiempoDescanso * 60000UL;
+
+  ultimaActualizacionTiempo = 0;
+
+  ledDescanso();
+
+  mostrarTiempo(
+    (unsigned long)tiempoDescanso * 60
+  );
+
+  actualizarLCD();
+
+  Serial.println("DESCANSO INICIADO");
+}
+
+// VOLVER AL MENU
+void volverMenu() {
+  estado = MENU;
+
+  temporizadorActivo = false;
+
+  ledsApagados();
+  mostrarTiempo(0);
+  actualizarLCD();
+
+  Serial.println("MENU");
+}
+
+// CONFIGURAR
+void setup() {
+  Serial.begin(115200);
+
+  // LEDS
+  pinMode(LED_AMARILLO, OUTPUT);
+  pinMode(LED_BLANCO, OUTPUT);
+  ledsApagados();
+
+  // JOYSTICK
+  pinMode(SW, INPUT_PULLUP);
+
+  // LCD
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("TRAINING");
+  lcd.setCursor(0, 1);
+  lcd.print("SISTEMA");
+
+  delay(1500);
+  lcd.clear();
+
+  // TM1637
+  display.setBrightness(5);
+  display.clear();
+
+  mostrarTiempo(
+    (unsigned long)tiempoEntreno * 60
+  );
+
+  // WIFI
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  Serial.print("MAC RECEPTOR: ");
+  Serial.println(WiFi.macAddress());
+
+  // ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ERROR ESP-NOW");
+
+    lcd.clear();
+    lcd.print("ERROR ESP-NOW");
+
+    while (true) delay(1000);
+  }
+
+  // REGISTRAR RECEPCION
+  esp_now_register_recv_cb(recibirDatos);
+
+  actualizarLCD();
+
+  Serial.println("RECEPTOR LISTO");
+  Serial.println("ESPERANDO DATOS DE LOS SENSORES");
+}
+
+// PROGRAMA PRINCIPAL
+void loop() {
+
+  // LEER JOYSTICK
+  int x = analogRead(VRX);
+
+  if (estado == MENU && puedeMover) {
+
+    // DERECHA: AUMENTAR ENTRENAMIENTO
+    if (x > 3000) {
+      tiempoEntreno++;
+
+      if (tiempoEntreno > 99) {
+        tiempoEntreno = 99;
+      }
+
+      puedeMover = false;
+      actualizarLCD();
+    }
+
+    // IZQUIERDA: DISMINUIR ENTRENAMIENTO
+    else if (x < 1000) {
+      tiempoEntreno--;
+
+      if (tiempoEntreno < 1) {
+        tiempoEntreno = 1;
+      }
+
+      puedeMover = false;
+      actualizarLCD();
+    }
+  }
+
+  // VOLVER A PERMITIR MOVIMIENTO
+  if (x > 1600 && x < 2400) {
+    puedeMover = true;
+  }
+
+  // BOTON DEL JOYSTICK
+  bool botonActual = digitalRead(SW);
+
+  if (
+    botonAnterior == HIGH &&
+    botonActual == LOW
+  ) {
+    delay(30);
+
+    if (digitalRead(SW) == LOW) {
+
+      if (estado == MENU) {
+        comenzarEntrenamiento();
+      }
+      else if (estado == ENTRENO) {
+        comenzarDescanso();
+      }
+      else if (estado == DESCANSO) {
+        volverMenu();
+      }
+
+      while (digitalRead(SW) == LOW) {
+        delay(10);
+      }
+    }
+  }
+
+  botonAnterior = botonActual;
+
+  // ACTUALIZAR LCD PERIODICAMENTE
+  static unsigned long ultimaLCD = 0;
+
+  if (millis() - ultimaLCD >= 300) {
+    actualizarLCD();
+    ultimaLCD = millis();
+  }
+
+  // CONTROL DEL TEMPORIZADOR
+  if (temporizadorActivo) {
+
+    unsigned long transcurrido =
+      millis() - inicioTemporizador;
+
+    if (transcurrido >= duracionTemporizador) {
+
+      if (estado == ENTRENO) {
+        comenzarDescanso();
+      }
+      else if (estado == DESCANSO) {
+        volverMenu();
+      }
+    }
+    else if (
+      millis() - ultimaActualizacionTiempo >= 250
+    ) {
+
+      unsigned long restante =
+        (duracionTemporizador - transcurrido) / 1000;
+
+      mostrarTiempo(restante);
+      ultimaActualizacionTiempo = millis();
+    }
+  }
+
+  delay(20);
+}(Receptor)
